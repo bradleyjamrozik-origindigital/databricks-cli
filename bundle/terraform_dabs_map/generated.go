@@ -33,7 +33,6 @@ package terraform_dabs_map
 // secret_scopes / databricks_secret_scope: 1 tf-only
 // sql_warehouses / databricks_sql_endpoint: 2 tf-only
 // synced_database_tables / databricks_database_synced_database_table: 5 dabs-only
-// volumes / databricks_volume: 1 tf-only
 
 // TerraformToDABsFieldMap maps DABs group name → nested TF segments → DABs segment name.
 // Navigate using TF field name segments; DABs is the corresponding DABs name when it differs.
@@ -650,9 +649,6 @@ var TerraformOnlyFields = map[string]FieldSet{
 	"sql_warehouses": {
 		"data_source_id": {},
 		"no_wait":        {},
-	},
-	"volumes": {
-		"volume_path": {},
 	},
 }
 
