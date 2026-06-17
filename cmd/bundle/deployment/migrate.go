@@ -240,9 +240,8 @@ To start using direct engine, set "engine: direct" under bundle in your databric
 		// Apply SecretScopeFixups so the config matches what the direct engine expects.
 		// This adds MANAGE ACL for the current user to all secret scopes, ensuring
 		// the migrated state and config agree on .permissions entries.
-		bundle.ApplyContext(ctx, b, resourcemutator.SecretScopeFixups(engine.EngineDirect))
-		if logdiag.HasError(ctx) {
-			return root.ErrAlreadyPrinted
+		if err := bundle.ApplyContext(ctx, b, resourcemutator.SecretScopeFixups(engine.EngineDirect)); err != nil {
+			return root.RenderAndReturnError(ctx, err)
 		}
 
 		plan, err := deploymentBundle.CalculatePlan(ctx, b.WorkspaceClient(ctx), &b.Config)
@@ -292,13 +291,12 @@ To start using direct engine, set "engine: direct" under bundle in your databric
 			return fmt.Errorf("upgrading state for apply: %w", err)
 		}
 
-		deploymentBundle.Apply(ctx, b.WorkspaceClient(ctx), plan, direct.MigrateMode(true))
-		if _, err := deploymentBundle.StateDB.Finalize(ctx); err != nil {
-			logdiag.LogError(ctx, err)
+		applyErr := deploymentBundle.Apply(ctx, b.WorkspaceClient(ctx), plan, direct.MigrateMode(true))
+		if _, finalizeErr := deploymentBundle.StateDB.Finalize(ctx); finalizeErr != nil {
+			applyErr = errors.Join(applyErr, finalizeErr)
 		}
-		if logdiag.HasError(ctx) {
-			logdiag.LogError(ctx, errors.New("migration failed; ensure you have done full deploy before the migration"))
-			return root.ErrAlreadyPrinted
+		if applyErr != nil {
+			return root.RenderAndReturnError(ctx, errors.Join(applyErr, errors.New("migration failed; ensure you have done full deploy before the migration")))
 		}
 
 		if err := os.Rename(tempStatePath, localPath); err != nil {

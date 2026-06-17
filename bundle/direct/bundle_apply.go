@@ -9,7 +9,6 @@ import (
 	"github.com/databricks/cli/bundle/config"
 	"github.com/databricks/cli/bundle/deployplan"
 	"github.com/databricks/cli/bundle/terraform_dabs_map"
-	"github.com/databricks/cli/libs/logdiag"
 	"github.com/databricks/cli/libs/structs/structaccess"
 	"github.com/databricks/cli/libs/structs/structpath"
 	"github.com/databricks/databricks-sdk-go"
@@ -17,34 +16,34 @@ import (
 
 type MigrateMode bool
 
-func (b *DeploymentBundle) Apply(ctx context.Context, client *databricks.WorkspaceClient, plan *deployplan.Plan, migrateMode MigrateMode) {
+func (b *DeploymentBundle) Apply(ctx context.Context, client *databricks.WorkspaceClient, plan *deployplan.Plan, migrateMode MigrateMode) error {
 	if plan == nil {
 		panic("Planning is not done")
 	}
 
 	if len(plan.Plan) == 0 {
 		// Avoid creating state file if nothing to deploy
-		return
+		return nil
 	}
 
 	b.StateDB.AssertOpenedForWrite()
 	b.RemoteStateCache.Clear()
+	b.deployErrs.reset()
 
 	g, err := makeGraph(plan)
 	if err != nil {
-		logdiag.LogError(ctx, err)
-		return
+		return err
 	}
 
 	g.Run(defaultParallelism, func(resourceKey string, failedDependency *string) bool {
 		entry, err := plan.WriteLockEntry(resourceKey)
 		if err != nil {
-			logdiag.LogError(ctx, fmt.Errorf("%s: internal error: %w", resourceKey, err))
+			b.deployErrs.add(fmt.Errorf("%s: internal error: %w", resourceKey, err))
 			return false
 		}
 
 		if entry == nil {
-			logdiag.LogError(ctx, fmt.Errorf("%s: internal error: node not in graph", resourceKey))
+			b.deployErrs.add(fmt.Errorf("%s: internal error: node not in graph", resourceKey))
 			return false
 		}
 
@@ -57,21 +56,21 @@ func (b *DeploymentBundle) Apply(ctx context.Context, client *databricks.Workspa
 		}
 
 		if action == deployplan.Undefined {
-			logdiag.LogError(ctx, fmt.Errorf("cannot deploy %s: unknown action %q", resourceKey, action))
+			b.deployErrs.add(fmt.Errorf("cannot deploy %s: unknown action %q", resourceKey, action))
 			return false
 		}
 
 		// If a dependency failed, report and skip execution for this node by returning false
 		if failedDependency != nil {
 			if action != deployplan.Skip {
-				logdiag.LogError(ctx, fmt.Errorf("%s: dependency failed: %s", errorPrefix, *failedDependency))
+				b.deployErrs.add(fmt.Errorf("%s: dependency failed: %s", errorPrefix, *failedDependency))
 			}
 			return false
 		}
 
 		adapter, err := b.getAdapterForKey(resourceKey)
 		if adapter == nil {
-			logdiag.LogError(ctx, fmt.Errorf("%s: internal error: cannot get adapter: %w", errorPrefix, err))
+			b.deployErrs.add(fmt.Errorf("%s: internal error: cannot get adapter: %w", errorPrefix, err))
 			return false
 		}
 
@@ -87,18 +86,18 @@ func (b *DeploymentBundle) Apply(ctx context.Context, client *databricks.Workspa
 				// direct state so the next direct deploy will plan and execute deletion.
 				id := b.StateDB.GetResourceID(resourceKey)
 				if id == "" {
-					logdiag.LogError(ctx, fmt.Errorf("%s: internal error: no ID in state", errorPrefix))
+					b.deployErrs.add(fmt.Errorf("%s: internal error: no ID in state", errorPrefix))
 					return false
 				}
 				if err = b.StateDB.SaveState(resourceKey, id, json.RawMessage("{}"), entry.DependsOn); err != nil {
-					logdiag.LogError(ctx, fmt.Errorf("%s: %w", errorPrefix, err))
+					b.deployErrs.add(fmt.Errorf("%s: %w", errorPrefix, err))
 					return false
 				}
 				return true
 			}
 			err = d.Destroy(ctx, &b.StateDB)
 			if err != nil {
-				logdiag.LogError(ctx, fmt.Errorf("%s: %w", errorPrefix, err))
+				b.deployErrs.add(fmt.Errorf("%s: %w", errorPrefix, err))
 				return false
 			}
 			return true
@@ -114,12 +113,12 @@ func (b *DeploymentBundle) Apply(ctx context.Context, client *databricks.Workspa
 			// Get the cached StructVar to check for unresolved refs and get value
 			sv, ok := b.StateCache.Load(resourceKey)
 			if !ok {
-				logdiag.LogError(ctx, fmt.Errorf("%s: internal error: missing cached StructVar", errorPrefix))
+				b.deployErrs.add(fmt.Errorf("%s: internal error: missing cached StructVar", errorPrefix))
 				return false
 			}
 
 			if len(sv.Refs) > 0 {
-				logdiag.LogError(ctx, fmt.Errorf("%s: unresolved references: %s", errorPrefix, jsonDump(sv.Refs)))
+				b.deployErrs.add(fmt.Errorf("%s: unresolved references: %s", errorPrefix, jsonDump(sv.Refs)))
 				return false
 			}
 
@@ -127,7 +126,7 @@ func (b *DeploymentBundle) Apply(ctx context.Context, client *databricks.Workspa
 				// In migration mode we're reading resources in DAG order so that we have fully resolved config snapshots stored
 				id := b.StateDB.GetResourceID(resourceKey)
 				if id == "" {
-					logdiag.LogError(ctx, fmt.Errorf("state entry not found for %q", resourceKey))
+					b.deployErrs.add(fmt.Errorf("state entry not found for %q", resourceKey))
 					return false
 				}
 				err = b.StateDB.SaveState(resourceKey, id, sv.Value, entry.DependsOn)
@@ -137,7 +136,7 @@ func (b *DeploymentBundle) Apply(ctx context.Context, client *databricks.Workspa
 			}
 
 			if err != nil {
-				logdiag.LogError(ctx, fmt.Errorf("%s: %w", errorPrefix, err))
+				b.deployErrs.add(fmt.Errorf("%s: %w", errorPrefix, err))
 				return false
 			}
 		}
@@ -149,13 +148,13 @@ func (b *DeploymentBundle) Apply(ctx context.Context, client *databricks.Workspa
 		if needRemoteState {
 			id := b.StateDB.GetResourceID(d.ResourceKey)
 			if id == "" {
-				logdiag.LogError(ctx, fmt.Errorf("%s: internal error: missing entry in state after deploy", errorPrefix))
+				b.deployErrs.add(fmt.Errorf("%s: internal error: missing entry in state after deploy", errorPrefix))
 				return false
 			}
 
 			err = d.refreshRemoteState(ctx, id)
 			if err != nil {
-				logdiag.LogError(ctx, fmt.Errorf("%s: failed to read remote state: %w", errorPrefix, err))
+				b.deployErrs.add(fmt.Errorf("%s: failed to read remote state: %w", errorPrefix, err))
 				return false
 			}
 			b.RemoteStateCache.Store(resourceKey, d.RemoteState)
@@ -163,6 +162,8 @@ func (b *DeploymentBundle) Apply(ctx context.Context, client *databricks.Workspa
 
 		return true
 	})
+
+	return b.deployErrs.join()
 }
 
 func (b *DeploymentBundle) LookupReferencePostDeploy(ctx context.Context, path *structpath.PathNode) (any, error) {
