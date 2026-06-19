@@ -22,6 +22,7 @@ import (
 	"github.com/databricks/cli/bundle/statemgmt"
 	"github.com/databricks/cli/libs/agent"
 	"github.com/databricks/cli/libs/cmdio"
+	"github.com/databricks/cli/libs/dms"
 	"github.com/databricks/cli/libs/log"
 	"github.com/databricks/cli/libs/logdiag"
 	"github.com/databricks/cli/libs/sync"
@@ -142,8 +143,16 @@ func Deploy(ctx context.Context, b *bundle.Bundle, outputHandler sync.OutputHand
 		return
 	}
 
-	// lock is acquired here
+	// lock is acquired here.
+	//
+	// Set up DMS recording of this deployment as a version. The version is not
+	// created until the plan is approved (below), so a cancelled deploy records
+	// nothing; the deferred CompleteVersion is a no-op until CreateVersion runs.
+	recorder := newDeploymentRecorder(ctx, b, engine, dms.VersionTypeDeploy)
 	defer func() {
+		if err := recorder.CompleteVersion(ctx, !logdiag.HasError(ctx)); err != nil {
+			logdiag.LogError(ctx, err)
+		}
 		bundle.ApplyContext(ctx, b, lock.Release(lock.GoalDeploy))
 	}()
 
@@ -208,6 +217,15 @@ func Deploy(ctx context.Context, b *bundle.Bundle, outputHandler sync.OutputHand
 		return
 	}
 	if haveApproval {
+		// Record the DMS version now that the plan is approved and the state WAL
+		// (with the lineage) has been opened. CreateVersion requests
+		// version_id == last_version_id + 1; the server returns ABORTED if a
+		// concurrent deploy advanced the deployment since the plan was computed,
+		// so a stale plan is not applied.
+		if err := recorder.CreateVersion(ctx); err != nil {
+			logdiag.LogError(ctx, err)
+			return
+		}
 		deployCore(ctx, b, plan, engine)
 	} else {
 		cmdio.LogString(ctx, "Deployment cancelled!")

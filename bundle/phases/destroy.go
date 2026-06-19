@@ -15,6 +15,7 @@ import (
 	"github.com/databricks/cli/bundle/direct"
 	"github.com/databricks/cli/libs/cmdio"
 	"github.com/databricks/cli/libs/diag"
+	"github.com/databricks/cli/libs/dms"
 	"github.com/databricks/cli/libs/log"
 	"github.com/databricks/cli/libs/logdiag"
 	"github.com/databricks/databricks-sdk-go/apierr"
@@ -127,7 +128,14 @@ func Destroy(ctx context.Context, b *bundle.Bundle, engine engine.EngineType) {
 		return
 	}
 
+	// Set up DMS recording of this destroy as a version. The version is not
+	// created until the destroy is approved (below), so a cancelled destroy
+	// records nothing; the deferred CompleteVersion is a no-op until then.
+	recorder := newDeploymentRecorder(ctx, b, engine, dms.VersionTypeDestroy)
 	defer func() {
+		if err := recorder.CompleteVersion(ctx, !logdiag.HasError(ctx)); err != nil {
+			logdiag.LogError(ctx, err)
+		}
 		bundle.ApplyContext(ctx, b, lock.Release(lock.GoalDestroy))
 	}()
 
@@ -183,6 +191,12 @@ func Destroy(ctx context.Context, b *bundle.Bundle, engine engine.EngineType) {
 				logdiag.LogError(ctx, err)
 				return
 			}
+		}
+		// Record the DMS version now that the destroy is approved and the state
+		// WAL (with the lineage) has been opened.
+		if err := recorder.CreateVersion(ctx); err != nil {
+			logdiag.LogError(ctx, err)
+			return
 		}
 		destroyCore(ctx, b, plan, engine)
 	} else {
