@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -21,11 +22,33 @@ import (
 )
 
 const (
-	currentStateVersion = 2
-	initialBufferSize   = 64 * 1024
-	maxWalEntrySize     = 10 * 1024 * 1024
-	walSuffix           = ".wal"
+	// currentStateVersion is the schema version written for all direct deployments
+	// and the target older states are migrated up to on load. Version 3 introduced
+	// the per-state feature list (Header.Features): from v3 on, additive capabilities
+	// are recorded as feature flags rather than version bumps, so bump this only for a
+	// structural change older CLIs cannot read (and add a migration for it).
+	currentStateVersion = 3
+
+	initialBufferSize = 64 * 1024
+	maxWalEntrySize   = 10 * 1024 * 1024
+	walSuffix         = ".wal"
 )
+
+// featureDummy is a placeholder feature flag used only to exercise the mechanism
+// in tests; no real deployment ever records it.
+const featureDummy = "dummy"
+
+// featureMinCLIVersion is the static list of deployment feature flags this CLI
+// supports, mapping each to the minimum CLI version required to read a state that
+// records it. To define a feature flag, add an entry here. Bumping a value raises
+// the version reported to older CLIs the next time a deploy records the feature.
+//
+// A state recording a feature absent from this list was written by a newer CLI;
+// checkSupportedFeatures rejects it and points the user at the version the state
+// recorded.
+var featureMinCLIVersion = map[string]string{
+	featureDummy: "1.2.0",
+}
 
 // errStaleWAL is returned when the WAL serial is behind the expected serial.
 // The caller should delete the stale WAL and proceed normally.
@@ -42,10 +65,17 @@ type DeploymentState struct {
 }
 
 type Header struct {
-	StateVersion int    `json:"state_version"`
-	CLIVersion   string `json:"cli_version"`
-	Lineage      string `json:"lineage"`
-	Serial       int    `json:"serial"`
+	StateVersion int `json:"state_version"`
+
+	// Features maps each feature flag this state depends on to the CLI version that
+	// recorded it. A CLI that does not recognize a feature reports that version so
+	// the user knows the minimum CLI to upgrade to (see checkSupportedFeatures).
+	// Empty/omitted for states that use no features.
+	Features map[string]string `json:"features,omitempty"`
+
+	CLIVersion string `json:"cli_version"`
+	Lineage    string `json:"lineage"`
+	Serial     int    `json:"serial"`
 }
 
 type Database struct {
@@ -204,6 +234,10 @@ func (db *DeploymentState) Open(ctx context.Context, path string, withRecovery W
 		return fmt.Errorf("migrating state %s: %w", path, err)
 	}
 
+	if err := checkSupportedFeatures(&db.Data); err != nil {
+		return err
+	}
+
 	if withWrite {
 		if err := os.MkdirAll(filepath.Dir(walPath), 0o755); err != nil {
 			return fmt.Errorf("failed to create state directory: %w", err)
@@ -221,7 +255,8 @@ func (db *DeploymentState) Open(ctx context.Context, path string, withRecovery W
 		walHead := Header{
 			Lineage:      lineage,
 			Serial:       db.Data.Serial + 1,
-			StateVersion: currentStateVersion,
+			StateVersion: db.Data.StateVersion,
+			Features:     db.Data.Features,
 			CLIVersion:   build.GetInfo().Version,
 		}
 		return appendJSONLine(db.walFile, walHead)
@@ -286,7 +321,6 @@ func (db *DeploymentState) mergeWalIntoState(ctx context.Context) (bool, error) 
 	scanner.Buffer(make([]byte, 0, initialBufferSize), maxWalEntrySize)
 	lineNumber := 0
 	var corruptedLines [][]byte
-	var newSerial int
 
 	for scanner.Scan() {
 		lineNumber++
@@ -310,7 +344,7 @@ func (db *DeploymentState) mergeWalIntoState(ctx context.Context) (bool, error) 
 			if header.Serial > expectedSerial {
 				return false, fmt.Errorf("WAL serial (%d) is ahead of expected (%d), state may be corrupted", header.Serial, expectedSerial)
 			}
-			newSerial = header.Serial
+			db.Data.Serial = expectedSerial
 		} else {
 			var entry WALEntry
 			if err := json.Unmarshal(line, &entry); err != nil {
@@ -345,19 +379,7 @@ func (db *DeploymentState) mergeWalIntoState(ctx context.Context) (bool, error) 
 		}
 	}
 
-	hasEntries := lineNumber > 1
-
-	// Only advance the serial when the WAL carried entries, because the caller
-	// (replayWAL) persists the new state file only in that case. A header-only
-	// WAL is a deploy that started but committed nothing; advancing the serial
-	// for it leaves the in-memory serial ahead of the persisted one, so the
-	// next deploy writes its WAL header at serial+2 and recovery rejects it as
-	// "ahead of expected". See acceptance/bundle/deploy/wal/header-only-wal.
-	if hasEntries {
-		db.Data.Serial = newSerial
-	}
-
-	return hasEntries, nil
+	return lineNumber > 1, nil
 }
 
 // Finalize replays the WAL (if open for write), captures the resulting state, and resets.
@@ -421,10 +443,47 @@ func (db *DeploymentState) UpgradeToWrite() error {
 	walHead := Header{
 		Lineage:      lineage,
 		Serial:       db.Data.Serial + 1,
-		StateVersion: currentStateVersion,
+		StateVersion: db.Data.StateVersion,
+		Features:     db.Data.Features,
 		CLIVersion:   build.GetInfo().Version,
 	}
 	return appendJSONLine(db.walFile, walHead)
+}
+
+// RecordFeature marks the state as depending on the named feature, stamping the
+// minimum CLI version required to read it (from featureMinCLIVersion). It must be
+// called before the WAL is started (UpgradeToWrite) so the change is captured in
+// the WAL header.
+func (db *DeploymentState) RecordFeature(name string) {
+	minVersion, ok := featureMinCLIVersion[name]
+	if !ok {
+		panic(fmt.Sprintf("internal error: unknown feature %q", name))
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.walFile != nil {
+		panic("internal error: RecordFeature must be called before the state is opened for write")
+	}
+	if db.Data.Features == nil {
+		db.Data.Features = make(map[string]string)
+	}
+	db.Data.Features[name] = minVersion
+}
+
+// checkSupportedFeatures rejects a state that records a feature flag this CLI does
+// not understand, pointing the user at the minimum CLI version the state recorded.
+func checkSupportedFeatures(db *Database) error {
+	names := make([]string, 0, len(db.Features))
+	for name := range db.Features {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		if _, ok := featureMinCLIVersion[name]; !ok {
+			return fmt.Errorf("the deployment state requires feature %q which this CLI (%s) does not support; upgrade to %s or newer", name, build.GetInfo().Version, db.Features[name])
+		}
+	}
+	return nil
 }
 
 func (db *DeploymentState) AssertOpenedForReadOrWrite() {
@@ -452,14 +511,9 @@ func ExportStateFromData(data Database) resourcestate.ExportedResourcesMap {
 	result := make(resourcestate.ExportedResourcesMap)
 	for key, entry := range data.State {
 		var etag string
-		// Extract etag for resources that use it for drift detection
-		// (dashboards and genie_spaces). Both follow the same pattern of
-		// persisting the backend-returned etag in state and comparing it
-		// against the remote on the next plan via OverrideChangeDesc.
-		// covered by test cases:
-		//   - bundle/deploy/dashboard/detect-change
-		//   - bundle/resources/genie_spaces/simple
-		if (strings.Contains(key, ".dashboards.") || strings.Contains(key, ".genie_spaces.")) && len(entry.State) > 0 {
+		// Extract etag for dashboards.
+		// covered by test case: bundle/deploy/dashboard/detect-change
+		if strings.Contains(key, ".dashboards.") && len(entry.State) > 0 {
 			var holder struct {
 				Etag string `json:"etag"`
 			}
@@ -469,9 +523,8 @@ func ExportStateFromData(data Database) resourcestate.ExportedResourcesMap {
 		}
 
 		result[key] = resourcestate.ResourceState{
-			ID:             entry.ID,
-			ETag:           etag,
-			StateSizeBytes: len(entry.State),
+			ID:   entry.ID,
+			ETag: etag,
 		}
 	}
 	return result
