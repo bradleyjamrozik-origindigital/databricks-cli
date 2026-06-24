@@ -10,6 +10,7 @@ import (
 	"github.com/databricks/cli/bundle"
 	"github.com/databricks/cli/bundle/config"
 	"github.com/databricks/cli/libs/diag"
+	"github.com/databricks/cli/libs/logdiag"
 )
 
 type processRootIncludes struct{}
@@ -49,6 +50,7 @@ func (m *processRootIncludes) Apply(ctx context.Context, b *bundle.Bundle) error
 	// Maintain list of files in order of files being loaded.
 	// This is stored in the bundle configuration for observability.
 	var files []string
+	var diags diag.Diagnostics
 
 	// We error on glob characters in the bundle root path since they are
 	// parsed by [filepath.Glob] as being glob patterns and thus can cause
@@ -69,7 +71,7 @@ func (m *processRootIncludes) Apply(ctx context.Context, b *bundle.Bundle) error
 	// For each glob, find all files to load.
 	// Ordering of the list of globs is maintained in the output.
 	// For matches that appear in multiple globs, only the first is kept.
-	for _, entry := range b.Config.Include {
+	for entryIndex, entry := range b.Config.Include {
 		// Include paths must be relative.
 		if filepath.IsAbs(entry) {
 			return diag.Errorf("%s: includes must be relative paths", entry)
@@ -89,7 +91,7 @@ func (m *processRootIncludes) Apply(ctx context.Context, b *bundle.Bundle) error
 
 		// Filter matches to ones we haven't seen yet.
 		var includes []string
-		for i, match := range matches {
+		for _, match := range matches {
 			rel, err := filepath.Rel(b.BundleRootPath, match)
 			if err != nil {
 				return err
@@ -99,14 +101,20 @@ func (m *processRootIncludes) Apply(ctx context.Context, b *bundle.Bundle) error
 			}
 			seen[rel] = true
 			if filepath.Ext(rel) != ".yaml" && filepath.Ext(rel) != ".yml" && filepath.Ext(rel) != ".json" {
-				return diag.Diagnostic{
-					Severity:  diag.Error,
-					Summary:   "Files in the 'include' configuration section must be YAML or JSON files.",
-					Detail:    fmt.Sprintf("The file %s in the 'include' configuration section is not a YAML or JSON file, and only such files are supported. To include files to sync, specify them in the 'sync.include' configuration section instead.", rel),
-					Locations: b.Config.GetLocations(fmt.Sprintf("include[%d]", i)),
-				}
+				diags = diags.Append(diag.Diagnostic{
+					Severity: diag.Error,
+					Summary:  "Files in the 'include' configuration section must be YAML or JSON files.",
+					Detail:   fmt.Sprintf("The file %s in the 'include' configuration section is not a YAML or JSON file, and only such files are supported. To include files to sync, specify them in the 'sync.include' configuration section instead.", rel),
+					// The match's index within the glob is unrelated to the entry's position in the include list.
+					Locations: b.Config.GetLocations(fmt.Sprintf("include[%d]", entryIndex)),
+				})
+				continue
 			}
 			includes = append(includes, rel)
+		}
+
+		if len(diags) > 0 {
+			return logdiag.Flush(ctx, diags)
 		}
 
 		// Add matches to list of mutators to return.
