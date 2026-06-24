@@ -199,7 +199,12 @@ func requirePrerequisites(t *testing.T) {
 	internal.RequireUV(t, "0.4")
 	// ruff 0.9.1 is pinned across the repo (python/pyproject.toml, Taskfile.yml);
 	// the check-formatting test's golden output assumes its formatter behavior.
-	internal.RequireRuff(t, "0.9.1")
+	// ruff is not bundled in the DBR test archive (only go, uv and jq are) and is
+	// absent from the serverless image, but no RunsOnDbr test needs it, so skip
+	// the check in DBR mode rather than failing the whole run.
+	if !WorkspaceTmpDir {
+		internal.RequireRuff(t, "0.9.1")
+	}
 	// Acceptance scripts import the stdlib tomllib module, added in Python 3.11.
 	internal.EnsurePython(t, "3.11")
 }
